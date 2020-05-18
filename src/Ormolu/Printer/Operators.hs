@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 
 -- | This module helps handle operator chains composed of different
 -- operators that may have different precedence and fixities.
@@ -13,10 +14,24 @@ where
 import Data.Function (on)
 import qualified Data.List as L
 import Data.Maybe (fromMaybe, mapMaybe)
-import Data.Ord (Down (Down), comparing)
+-- import Data.Ord (Down (Down), comparing)
 import GHC
 import OccName (mkVarOcc)
-import Ormolu.Utils (unSrcSpan)
+import Ormolu.Utils (unSrcSpan, showOutputable)
+
+-- import qualified Data.Map.Strict as M
+-- import Data.Map.Strict (Map)
+
+import Debug.Trace
+
+-- traceShowId :: a -> a
+-- traceShowId = id
+
+instance Show RdrName where
+  show = showOutputable
+
+instance Show Fixity where
+  show = showOutputable
 
 -- | Intermediate representation of operator trees. It has two type
 -- parameters: @ty@ is the type of sub-expressions, while @op@ is the type
@@ -73,7 +88,7 @@ reassociateOpTreeWith fixityMap getOpName = go
     -- the right branch is right-associated. This function picks up one item
     -- from the right and inserts it correctly to the left.
     --
-    -- Also, we are using the 'compareFixity' function which returns if the
+    -- Also, we are using the 'compareFixity' function which tells if the
     -- expression should associate to right.
     go :: OpTree ty op -> OpTree ty op
     -- base cases
@@ -93,6 +108,20 @@ reassociateOpTreeWith fixityMap getOpName = go
         then go $ OpBranch (OpBranch l op (go $ OpBranch r op' l')) op'' r'
         else go $ OpBranch (OpBranch (OpBranch l op r) op' l') op'' r'
 
+-- data Score
+--   = UserHint Int Int -- ^ Column and line
+--   | Unhelpful
+--   deriving (Eq, Show)
+
+-- compareScores :: Score -> Score -> Ordering
+-- compareScores (UserHint c0 l0) (UserHint c1 l1) =
+--   case ((c0 `compare` c1), (l0 `compare` l1)) of
+--     (o, GT) -> o
+--     (_, o) -> o
+-- compareScores Unhelpful (UserHint _ _) = GT
+-- compareScores (UserHint _ _) Unhelpful = LT
+-- compareScores Unhelpful Unhelpful = EQ
+
 -- | Build a map of inferred 'Fixity's from an 'OpTree'.
 buildFixityMap ::
   forall ty op.
@@ -103,21 +132,24 @@ buildFixityMap ::
   -- | Fixity map
   [(RdrName, Fixity)]
 buildFixityMap getOpName opTree =
-  concatMap (\(i, ns) -> map (\(n, _) -> (n, fixity i InfixL)) ns)
+  traceShowId
+    . concatMap (\(i, ns) -> map (\(n, _) -> (n, fixity i InfixL)) ns)
     . zip [0 ..]
-    . L.groupBy (doubleWithinEps 0.00001 `on` snd)
+    . L.groupBy ((==) `on` snd) -- doubleWithinEps 0.00001
     . (overrides ++)
+    . traceShowId
     . modeScores
+    . traceShowId
     $ score opTree
   where
     -- Add a special case for ($), since it is pretty unlikely for someone
     -- to override it.
-    overrides :: [(RdrName, Double)]
+    overrides :: [(RdrName, Int)]
     overrides =
-      [ (mkRdrUnqual $ mkVarOcc "$", -1)
+      [ (mkRdrUnqual (mkVarOcc "$"), -1)
       ]
     -- Assign scores to operators based on their location in the source.
-    score :: OpTree (Located ty) (Located op) -> [(RdrName, Double)]
+    score :: OpTree (Located ty) (Located op) -> [(RdrName, Int)]
     score (OpNode _) = []
     score (OpBranch l o r) = fromMaybe (score r) $ do
       -- If we fail to get any of these, 'defaultFixity' will be used by
@@ -132,18 +164,19 @@ buildFixityMap getOpName opTree =
             | le < ob =
               -- if the operator is in the beginning of a line, assign
               -- a score relative to its column within range [0, 1).
-              fromIntegral oc / fromIntegral (maxCol + 1)
+              oc -- / fromIntegral (maxCol + 1)
             | oe < rb =
               -- if the operator is in the end of the line, assign the
               -- score 1.
-              1
+              100
             | otherwise =
-              2 -- otherwise, assign a high score.
+              200 -- otherwise, assign a high score.
       return $ (opName, s) : score r
-    -- Pick the most common score per 'RdrName'.
-    modeScores :: [(RdrName, Double)] -> [(RdrName, Double)]
+    -- Pick a score per 'RdrName'.
+    modeScores :: [(RdrName, Int)] -> [(RdrName, Int)]
     modeScores =
       L.sortOn snd
+      -- L.sortBy (compareScores `on` snd)
         . mapMaybe
           ( \case
               [] -> Nothing
@@ -151,24 +184,30 @@ buildFixityMap getOpName opTree =
           )
         . L.groupBy ((==) `on` fst)
         . L.sort
-    -- Return the most common number, leaning to the smaller
-    -- one in case of a tie.
-    mode :: [Double] -> Double
-    mode =
-      head
-        . L.minimumBy (comparing (Down . length))
-        . L.groupBy (doubleWithinEps 0.0001)
-        . L.sort
-    -- The start column of the rightmost operator.
-    maxCol = go opTree
-      where
-        go (OpNode (L _ _)) = 0
-        go (OpBranch l (L o _) r) =
-          maximum
-            [ go l,
-              maybe 0 srcSpanStartCol (unSrcSpan o),
-              go r
-            ]
+    -- -- The start column of the rightmost operator.
+    -- maxCol = go opTree
+    --   where
+    --     go (OpNode (L _ _)) = 0
+    --     go (OpBranch l (L o _) r) =
+    --       maximum
+    --         [ go l,
+    --           maybe 0 srcSpanStartCol (unSrcSpan o),
+    --           go r
+    --         ]
+
+-- Return the most common number, leaning to the smaller
+-- one in case of a tie.
+mode :: [Int] -> Int
+mode = minimum -- L.minimumBy compareScores
+
+  --  | 200 `elem` xs = 200 - length (filter (/= 200) xs)
+  --  | otherwise = minimum xs
+
+  -- last -- head
+  --   . L.minimumBy (comparing (Down . length))
+  --   . L.groupBy (==) -- (doubleWithinEps 0.0001)
+  --   . L.sort
+  --   . traceShowId
 
 ----------------------------------------------------------------------------
 -- Helpers
@@ -186,5 +225,5 @@ normalizeOpTree (OpBranch (OpBranch l' lop' r') lop r) =
 fixity :: Int -> FixityDirection -> Fixity
 fixity = Fixity NoSourceText
 
-doubleWithinEps :: Double -> Double -> Double -> Bool
-doubleWithinEps eps a b = abs (a - b) < eps
+-- doubleWithinEps :: Double -> Double -> Double -> Bool
+-- doubleWithinEps eps a b = abs (a - b) < eps
